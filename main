@@ -1,0 +1,123 @@
+import os
+import torch
+import torch.nn as nn
+import numpy as np
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+import torch.utils.data as Data
+from sklearn.metrics.cluster import normalized_mutual_info_score
+import util
+import models
+import clustering
+import warnings
+
+warnings.filterwarnings('ignore')
+
+
+#load dataset:
+BATCH_SIZE = 50
+normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                     std=[0.229, 0.224, 0.225])
+tra = [transforms.Resize(40),
+       transforms.CenterCrop(32),
+       transforms.ToTensor(),
+       normalize]
+trainset = datasets.MNIST(root='./mnist/',train=True,download=True,transform=transforms.Compose(tra),)
+trainloader = Data.DataLoader(dataset=trainset,batch_size=BATCH_SIZE,shuffle=True)
+testset = datasets.MNIST(root='./mnist/',train=False,transform=transforms.Compose(tra),)
+testloader = Data.DataLoader(dataset=testset,batch_size=BATCH_SIZE,shuffle=False,)
+
+#CNN
+model = models.AlexNet()
+fd = int(model.top_layer.weight.size()[1])
+model.top_layer = None
+# model.features = torch.nn.DataParallel(model.features)        # data->CUDA
+
+# create optimizer
+optimizer = torch.optim.SGD(
+    filter(lambda x: x.requires_grad, model.parameters()), #产生迭代器，x.requires_grad为真带入parameters()
+    lr=0.001,
+)
+# define loss function
+criterion = nn.CrossEntropyLoss()
+# clustering algorithm to use
+deepcluster = clustering.Kmeans(10)
+# creating cluster assignments log
+cluster_log = util.Logger(os.path.join( 'clusters'))
+
+def train(loader, model, crit, opt, epoch):
+    # record & update losses
+    losses = util.AverageMeter()
+    # switch to train mode
+    model.train()
+    # create an optimizer for the last fc layer
+    optimizer_tl = torch.optim.SGD(
+        model.top_layer.parameters(),
+        lr=0.001,
+    )
+    for i, (input_tensor, target) in enumerate(loader):  # loader->train_loader, target为fake labels
+        input_var = torch.autograd.Variable(input_tensor)
+        target_var = torch.autograd.Variable(target)
+        output = model(input_var)
+        loss = crit(output, target_var)
+        # record loss
+        losses.update(loss.data.item(), input_tensor.size(0))
+        # compute gradient and do SGD step
+        opt.zero_grad()  # opt->参数优化器
+        optimizer_tl.zero_grad()
+        loss.backward()
+        opt.step()
+        optimizer_tl.step()
+        if i%100 == 99:
+            print('Epoch: [{0}][{1}/{2}]\t'
+                  'Loss: {loss.val:.4f} ({loss.avg:.4f})'
+                  .format(epoch, i+1, len(loader),loss=losses))
+    return losses.avg
+
+#training conv-net
+EPOCH = 100
+img = util.to_PIL(trainset)
+for epoch in range(EPOCH):
+    # remove head
+    model.top_layer = None
+    model.classifier = nn.Sequential(*list(model.classifier.children())[:-1])
+    # get the features for the whole dataset
+    features = util.compute_features(trainloader, model, len(trainset))      #len(trainset) = 60000
+    # cluster the features
+    I = deepcluster.cluster(features)
+    # assign the pseudolaels
+    train_dataset = clustering.cluster_assign(deepcluster.images_lists, img)
+    # uniformely sample per target
+    sampler = util.UnifLabelSampler(len(train_dataset),deepcluster.images_lists)
+    # make train_dataloader -> images_data & pseudolabels
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        sampler=sampler,
+        pin_memory=True,
+    )
+    # set last fully connected layer
+    mlp = list(model.classifier.children())
+    mlp.append(nn.ReLU(inplace=True))
+    model.classifier = nn.Sequential(*mlp)
+    model.top_layer = nn.Linear(fd, len(deepcluster.images_lists))
+    model.top_layer.weight.data.normal_(0, 0.01)
+    model.top_layer.bias.data.zero_()
+
+    # train network with clusters as pseudo-labels
+    loss = train(train_dataloader, model, criterion, optimizer, epoch)
+
+    #print nmi & loss
+    if epoch>0:
+        nmi = normalized_mutual_info_score(
+            clustering.arrange_clustering(deepcluster.images_lists),
+            clustering.arrange_clustering(cluster_log.data[-1])
+        )
+        print('NMI against previous assignment: {0:.3f}'.format(nmi))
+    # log the cluster assignment
+    cluster_log.log(deepcluster.images_lists)
+
+
+
+
+
